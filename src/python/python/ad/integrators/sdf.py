@@ -8,6 +8,253 @@ import gc
 
 from .common import ADIntegrator
 
+def _sample_warp_field(params: mi.SceneParameters,
+                       pos: mi.Vector3f,
+                       dir: mi.Vector3f,
+                       ray_march_eps: mi.Float,
+                       𝜆d: mi.Float,
+                       exponent: mi.Float,
+                       active: mi.Bool):
+    t, _, n, _ = eval_scene(params, pos, ray_march_eps, active)
+
+    V_direct = t * dr.detach(n)
+
+    with dr.suspend_grad():
+        S = dr.abs(t) + 𝜆d * dr.abs(dr.dot(n, dir))
+        w = dr.select(S > 1e-4, dr.power(dr.rcp(S), exponent), 0.0)
+
+    # # Sample an auxiliary ray from a von Mises Fisher distribution
+    # omega_local = mi.warp.square_to_von_mises_fisher(sample, kappa)
+
+    # # Antithetic sampling (optional)
+    # omega_local.x[flip] = -omega_local.x
+    # omega_local.y[flip] = -omega_local.y
+
+    # aux_ray = mi.Ray3f(
+    #     o = ray.o,
+    #     d = ray_frame.to_world(omega_local),
+    #     time = ray.time)
+
+    # # Compute an intersection that follows the intersected shape. For example,
+    # # a perturbation of the translation parameter will propagate to 'si.p'.
+    # # Propagation of such gradients guarantees the correct evaluation of 'V_direct'.
+    # si = scene.ray_intersect(aux_ray,
+    #                          ray_flags=mi.RayFlags.All | mi.RayFlags.FollowShape | mi.RayFlags.BoundaryTest,
+    #                          coherent=False)
+
+    # # Convert into a direction at 'ray.o'. When no surface was intersected,
+    # # copy the original direction
+    # hit = si.is_valid()
+    # V_direct = dr.select(hit, dr.normalize(si.p - ray.o), ray.d)
+
+    # with dr.suspend_grad():
+    #     # Boundary term provided by the underlying shape
+    #     B = dr.select(hit, si.boundary_test, 1.0)
+
+    #     # Inverse of vMF density without normalization constant
+    #     # inv_vmf_density = dr.exp(dr.fma(-omega_local.z, kappa, kappa))
+
+    #     # Better version (here, dr.exp() is constant). However, assumes a
+    #     # specific implementation in mi.warp.square_to_von_mises_fisher() (TODO)
+    #     inv_vmf_density = dr.rcp(dr.fma(sample.y, dr.exp(-2 * kappa), 1 - sample.y))
+
+    #     # Compute harmonic weight, being wary of division by near-zero values
+    #     w_denom = inv_vmf_density - 1 + B
+    #     w_denom_rcp = dr.select(w_denom > 1e-4, dr.rcp(w_denom), 0.0)  # 1 / (D + B)
+    #     w = dr.power(w_denom_rcp, exponent) * inv_vmf_density
+
+    #     # Analytic weight gradient w.r.t. `ray.d` (detaching inv_vmf_density gradient)
+    #     tmp1 = inv_vmf_density * w * w_denom_rcp * kappa * exponent
+    #     tmp2 = ray_frame.to_world(mi.Vector3f(omega_local.x, omega_local.y, 0))
+    #     d_w_omega = dr.clamp(tmp1, -1e10, 1e10) * tmp2
+
+    return w, d_w_omega, w * V_direct, dr.dot(d_w_omega, V_direct), dr.detach(t)
+
+
+class _ReparameterizeOp(dr.CustomOp):
+    def eval(self, scene, sensor, params, pos, ray_march_max_it, ray_march_eps,
+             𝜆d, exponent, active):
+        # Stash all of this information for the forward/backward passes
+        self.scene = scene
+        self.sensor = sensor
+        self.params = params
+        self.pos = dr.detach(pos)
+        self.ray_march_max_it = ray_march_max_it
+        self.ray_march_eps = ray_march_eps
+        self.𝜆d = 𝜆d
+        self.exponent = exponent
+        self.active = active
+
+        # The reparameterization is simply the identity in primal mode
+        return self.pos, dr.full(mi.Float, 1, dr.width(pos))
+
+
+    def forward(self):
+        """
+        Propagate the gradients in the forward direction to 'ray.d' and the
+        jacobian determinant 'det'. From a warp field point of view, the
+        derivative of 'ray.d' is the warp field direction at 'ray', and
+        the derivative of 'det' is the divergence of the warp field at 'ray'.
+        """
+
+        # Initialize some accumulators
+        Z = mi.Float(0.0)
+        dZ = mi.Vector3f(0.0)
+        grad_V = mi.Vector3f(0.0)
+        grad_div_lhs = mi.Float(0.0)
+        it = mi.UInt32(0)
+        active = mi.Bool(self.active)
+        t_prev = mi.Float(0.0)
+
+        pos_grad = self.grad_in('pos')
+
+        loop = mi.Loop(name="reparameterize_screen_pos(): forward propagation",
+                       state=lambda: (it, active, t_prev, Z, dZ, grad_V, grad_div_lhs))
+
+        # Unroll the entire loop in wavefront mode
+        # loop.set_uniform(True) # TODO can we turn this back on? (see self.active in loop condition)
+        loop.set_max_iterations(self.ray_march_max_it)
+        loop.set_eval_stride(self.ray_march_max_it)
+
+        while loop(active & (it < self.ray_march_max_it)):
+            u = mi.Vector2f(self.pos)
+            dr.enable_grad(u)
+            dr.set_grad(u, pos_grad)
+            ray, _, _ = sample_rays_from_screen_pos(u, self.sensor)
+
+            p = ray.o + t_prev * ray.d
+
+            Z_i, dZ_i, V_i, div_lhs_i, t = _sample_warp_field(self.params, p,
+                                                              self.ray_march_eps,
+                                                              self.𝜆d,
+                                                              self.exponent)
+
+            # Do not clear input vertex gradient
+            dr.forward_to(V_i, div_lhs_i,
+                          flags=dr.ADFlag.ClearEdges | dr.ADFlag.ClearInterior)
+
+            t_prev += t
+
+            Z += Z_i * t
+            dZ += dZ_i * t
+            grad_V += dr.grad(V_i) * t
+            grad_div_lhs += dr.grad(div_lhs_i) * t
+            it += 1
+
+        inv_Z = dr.rcp(dr.maximum(Z, 1e-8))
+        V_theta  = grad_V * inv_Z
+        div_V_theta = (grad_div_lhs - dr.dot(V_theta, dZ)) * inv_Z
+
+        # Ignore inactive lanes
+        V_theta = dr.select(self.active, V_theta, 0.0)
+        div_V_theta = dr.select(self.active, div_V_theta, 0.0)
+
+        self.set_grad_out((V_theta, div_V_theta))
+
+    def backward(self):
+        pass
+
+    def name(self):
+        return "reparameterize_screen_pos()"
+
+
+def reparameterize_screen_pos(scene: mi.Scene,
+                              sensor: mi.Sensor,
+                              params: mi.SceneParameters,
+                              pos: mi.Vector2f,
+                              ray_march_max_it: int=32,
+                              ray_march_eps=1e-3,
+                              𝜆d: float=1e-1,
+                              exponent: float=4.0,
+                              active: mi.Bool = True
+) -> Tuple[mi.Vector2f, mi.Float]:
+    return dr.custom(_ReparameterizeOp, scene, sensor, params, pos,
+                     ray_march_max_it, ray_march_eps, 𝜆d, exponent, active)
+
+
+class _ReparamWrapper:
+    # ReparamWrapper instances can be provided as dr.Loop state
+    # variables. For this to work we must declare relevant fields
+    DRJIT_STRUCT = { }
+
+    def __init__(self,
+                 scene : mi.Scene,
+                 sensor: mi.Sensor,
+                 params: Any,
+                 reparam: Callable[
+                     [mi.Scene, mi.Sensor, mi.SceneParameters, mi.Vector2f,
+                      float, float, mi.Bool],
+                     Tuple[mi.Vector2f, mi.Float]]):
+
+        self.scene = scene
+        self.sensor = sensor
+        self.params = params
+        self.reparam = reparam
+
+        # Only link the reparameterization CustomOp to differentiable scene
+        # parameters with the AD computation graph if they control shape
+        # information (vertex positions, etc.)
+        if isinstance(params, mi.SceneParameters):
+            params = params.copy()
+            params.keep(
+                [
+                    k for k in params.keys() \
+                        if (params.flags(k) & mi.ParamFlags.Discontinuous) != 0
+                ]
+            )
+
+    def __call__(self,
+                 pos: mi.Vector2f,
+                 active: Union[mi.Bool, bool] = True
+    ) -> Tuple[mi.Vector2f, mi.Float]:
+        return self.reparam(self.scene, self.sensor, self.params, pos, active=active)
+
+
+def sample_rays_from_screen_pos(
+    pos_f: mi.Vector2f,
+    sensor: mi.Sensor,
+) -> Tuple[mi.RayDifferential3f, mi.Spectrum, mi.Vector2f]:
+    film = sensor.film()
+    rfilter = film.rfilter()
+
+    # Re-scale the position to [0, 1]^2
+    scale = dr.rcp(mi.ScalarVector2f(film.crop_size()))
+    offset = -mi.ScalarVector2f(film.crop_offset()) * scale
+    pos_adjusted = dr.fma(pos_f, scale, offset)
+
+    with dr.resume_grad():
+        ray, weight = sensor.sample_ray_differential(
+            time=0,
+            sample1=0,
+            sample2=pos_adjusted,
+            sample3=mi.Point2f(0, 0)
+        )
+
+    # With box filter, ignore random offset to prevent numerical instabilities
+    splatting_pos = mi.Vector2f(mi.Vector2d(pos_f)) if rfilter.is_box_filter() else pos_f
+
+    return ray, weight, splatting_pos
+
+def eval_scene(
+    params: mi.SceneParameters,
+    p: mi.Vector3f,
+    eps: mi.Float,
+    active: mi.Bool,
+) -> Tuple[mi.Float, mi.Bool, mi.Vector3f, mi.Color3f]:
+    color = params.get('sphere.bsdf.reflectance.value')
+    to_world = params.get('sphere.to_world')
+
+    sphere = SphereSDF(
+        color,
+        to_world,
+        mi.Float(1)
+    )
+
+    t, n = sphere.eval(p, active)
+    hit = dr.abs(t) < eps
+
+    return t, hit, n, mi.Color3f(dr.select(hit, sphere.color, mi.Color3f(0)))
+
 class SphereSDF:
     DRJIT_STRUCT = { 'color' : mi.Color3f, 'transform': mi.Transform4f, 'scale' : mi.Float }
 
@@ -19,16 +266,38 @@ class SphereSDF:
     def eval(self,
         position: mi.Point3f,
         active: mi.Bool):
-        transformed_p = self.transform.inverse().transform_affine(position)
+        T_inv = self.transform.inverse()
+        transformed_p = T_inv.transform_affine(position)
         p = transformed_p / self.scale
-        return self.scale * (dr.norm(p) - 1.0), dr.normalize(mi.Vector3f(transformed_p))
+        norm_p = dr.norm(p)
+
+        norm_grad = p / norm_p
+        normal = dr.transpose(mi.Matrix3f(T_inv.matrix))@norm_grad
+
+        return self.scale * (norm_p - 1.0), normal
 
 class SDFIntegrator(ADIntegrator):
     def __init__(self, props=...):
         super().__init__(props)
 
-        self.eps = mi.Float(1e-3)
-        self.max_it = mi.UInt32(64)
+        self.ray_march_max_it =  props.get('ray_march_max_it', 32)
+        self.ray_march_eps = props.get('ray_march_eps', 1e-3)
+
+        self.reparam_𝜆d = props.get('reparam_kappa', 1e-1)
+        self.reparam_exp = props.get('reparam_exp', 4)
+
+    def reparam(self,
+            scene: mi.Scene,
+            sensor: mi.Sensor,
+            params: mi.SceneParameters,
+            pos: mi.Vector2f,
+            active: mi.Bool):
+        return reparameterize_screen_pos(scene, sensor, params, pos,
+                                         ray_march_max_it=self.ray_march_max_it,
+                                         ray_march_eps=self.ray_march_eps,
+                                         𝜆d=self.reparam_𝜆d,
+                                         exponent=self.reparam_exp,
+                                         active=active)
 
     def ray_march_scene(self,
         primal: mi.Bool,
@@ -47,19 +316,10 @@ class SDFIntegrator(ADIntegrator):
                        state=lambda: (it, p, n, c, active))
         
         params = mi.traverse(scene)
-        color = params.get('sphere.bsdf.reflectance.value')
-        to_world = params.get('sphere.to_world')
-
-        sphere = SphereSDF(
-            color,
-            to_world,
-            mi.Float(1)
-        )
 
         with dr.suspend_grad(when=not primal):
-            while loop(active & (it < self.max_it)):
-                t, n = sphere.eval(p, active)
-                hit = dr.abs(t) < self.eps
+            while loop(active & (it < self.ray_march_max_it)):
+                t, hit, n, c = eval_scene(params, p, self.ray_march_eps, active)
 
                 p[active] = mi.Point3f(p + t * ray.d)
 
@@ -67,10 +327,9 @@ class SDFIntegrator(ADIntegrator):
                 it[active] += 1
 
         if not primal:
-            _, n = sphere.eval(p, active)
+            _, _, n, c = eval_scene(params, p, self.ray_march_eps, True)
 
-        valid = dr.neq(it, self.max_it)
-        c = dr.select(valid, sphere.color, c)
+        valid = dr.neq(it, self.ray_march_max_it)
 
         return n, c, valid
 
@@ -79,9 +338,6 @@ class SDFIntegrator(ADIntegrator):
         scene: mi.Scene,
         sampler: mi.Sampler,
         ray: mi.Ray3f,
-        reparam: Optional[
-            Callable[[mi.Ray3f, mi.Bool],
-                    Tuple[mi.Ray3f, mi.Float]]],
         active: mi.Bool,
         **kwargs # Absorbs unused arguments
     ) -> Tuple[mi.Spectrum, mi.Bool, mi.Spectrum]:
@@ -96,7 +352,75 @@ class SDFIntegrator(ADIntegrator):
 
         return L, active, None
     
-    def render(self: mi.SamplingIntegrator,
+    def sample_screen_pos(self,
+        scene: mi.Scene,
+        sensor: mi.Sensor,
+        sampler: mi.Sampler,
+        reparam: Callable[[mi.Vector2f, mi.Bool],
+                          Tuple[mi.Vector2f, mi.Float]] = None
+    ) -> Tuple[mi.Vector2f, mi.Float]:
+        film = sensor.film()
+        film_size = film.crop_size()
+        rfilter = film.rfilter()
+        border_size = rfilter.border_size()
+
+        if film.sample_border():
+            film_size += 2 * border_size
+
+        spp = sampler.sample_count()
+
+        # Compute discrete sample position
+        idx = dr.arange(mi.UInt32, dr.prod(film_size) * spp)
+
+        # Try to avoid a division by an unknown constant if we can help it
+        log_spp = dr.log2i(spp)
+        if 1 << log_spp == spp:
+            idx >>= dr.opaque(mi.UInt32, log_spp)
+        else:
+            idx //= dr.opaque(mi.UInt32, spp)
+
+        # Compute the position on the image plane
+        pos = mi.Vector2i()
+        pos.y = idx // film_size[0]
+        pos.x = dr.fma(-film_size[0], pos.y, idx)
+
+        if film.sample_border():
+            pos -= border_size
+
+        pos += mi.Vector2i(film.crop_offset())
+
+        # Cast to floating point and add random offset
+        pos_f = mi.Vector2f(pos) + sampler.next_2d()
+
+        reparam_det = 1.0
+
+        if reparam is not None:
+            if rfilter.is_box_filter():
+                raise Exception(
+                    "ADIntegrator detected the potential for image-space "
+                    "motion due to differentiable shape or camera pose "
+                    "parameters. This is, however, incompatible with the box "
+                    "reconstruction filter that is currently used. Please "
+                    "specify a smooth reconstruction filter in your scene "
+                    "description (e.g. 'gaussian', which is actually the "
+                    "default)")
+
+            # This is less serious, so let's just warn once
+            if not film.sample_border():
+                mi.Log(mi.LogLevel.Warn,
+                    "ADIntegrator detected the potential for image-space "
+                    "motion due to differentiable shape or camera pose "
+                    "parameters. To correctly account for shapes entering "
+                    "or leaving the viewport, it is recommended that you set "
+                    "the film's 'sample_border' parameter to True.")
+
+            with dr.resume_grad():
+                # Reparameterize the camera ray
+                pos_f, reparam_det = reparam(pos=dr.detach(pos_f))
+
+        return pos_f, reparam_det
+    
+    def render(self: SDFIntegrator,
                scene: mi.Scene,
                sensor: Union[int, mi.Sensor] = 0,
                seed: int = 0,
@@ -122,7 +446,8 @@ class SDFIntegrator(ADIntegrator):
             )
 
             # Generate a set of rays starting at the sensor
-            ray, weight, pos, _ = self.sample_rays(scene, sensor, sampler)
+            pos_f, _ = self.sample_screen_pos(scene, sensor, sampler)
+            ray, weight, pos = sample_rays_from_screen_pos(pos_f, sensor)
 
             # Launch the Monte Carlo sampling process in primal mode
             L, valid, state = self.sample(
@@ -133,7 +458,6 @@ class SDFIntegrator(ADIntegrator):
                 depth=mi.UInt32(0),
                 δL=None,
                 state_in=None,
-                reparam=None,
                 active=mi.Bool(True)
             )
 
@@ -162,8 +486,87 @@ class SDFIntegrator(ADIntegrator):
             self.primal_image = sensor.film().develop()
 
             return self.primal_image
+        
+    def render_forward(self: SDFIntegrator,
+                       scene: mi.Scene,
+                       params: Any,
+                       sensor: Union[int, mi.Sensor] = 0,
+                       seed: int = 0,
+                       spp: int = 0) -> mi.TensorXf:
 
-    def render_backward(self: mi.SamplingIntegrator,
+        if isinstance(sensor, int):
+            sensor = scene.sensors()[sensor]
+
+        film = sensor.film()
+        aovs = self.aovs()
+
+        # Disable derivatives in all of the following
+        with dr.suspend_grad():
+            # Prepare the film and sample generator for rendering
+            sampler, spp = self.prepare(sensor, seed, spp, aovs)
+
+            # When the underlying integrator supports reparameterizations,
+            # perform necessary initialization steps and wrap the result using
+            # the _ReparamWrapper abstraction defined above
+            if hasattr(self, 'reparam'):
+                reparam = _ReparamWrapper(
+                    scene=scene,
+                    sensor=sensor,
+                    params=params,
+                    reparam=self.reparam
+                )
+            else:
+                reparam = None
+
+            # Generate a set of rays starting at the sensor, keep track of
+            # derivatives wrt. sample positions ('pos') if there are any
+            pos_f, det = self.sample_screen_pos(scene, sensor, sampler, reparam)
+            ray, weight, pos = sample_rays_from_screen_pos(pos_f, sensor)
+
+            with dr.resume_grad():
+                L, valid, _ = self.sample(
+                    mode=dr.ADMode.Forward,
+                    scene=scene,
+                    sampler=sampler,
+                    ray=ray,
+                    reparam=reparam,
+                    active=mi.Bool(True)
+                )
+
+                block = film.create_block()
+                # Only use the coalescing feature when rendering enough samples
+                block.set_coalesce(block.coalesce() and spp >= 4)
+
+                # Deposit samples with gradient tracking for 'pos'.
+                # After reparameterizing the camera ray, we need to evaluate
+                #   Σ (fi Li det)
+                #  ---------------
+                #   Σ (fi det)
+                if (dr.all(mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special))):
+                    aovs = sensor.film().prepare_sample(L * weight * det, ray.wavelengths,
+                                                        block.channel_count(),
+                                                        weight=det,
+                                                        alpha=dr.select(valid, mi.Float(1), mi.Float(0)))
+                    block.put(pos, aovs)
+                    del aovs
+                else:
+                    block.put(
+                        pos=pos,
+                        wavelengths=ray.wavelengths,
+                        value=L * weight * det,
+                        weight=det,
+                        alpha=dr.select(valid, mi.Float(1), mi.Float(0))
+                    )
+
+                # Perform the weight division and return an image tensor
+                film.put_block(block)
+                result_img = film.develop()
+
+                dr.forward_to(result_img)
+
+        return dr.grad(result_img)
+
+    def render_backward(self: SDFIntegrator,
                         scene: mi.Scene,
                         params: Any,
                         grad_in: mi.TensorXf,
@@ -185,21 +588,20 @@ class SDFIntegrator(ADIntegrator):
             # When the underlying integrator supports reparameterizations,
             # perform necessary initialization steps and wrap the result using
             # the _ReparamWrapper abstraction defined above
-            if False: #hasattr(self, 'reparam'):
+            if hasattr(self, 'reparam'):
                 reparam = _ReparamWrapper(
                     scene=scene,
+                    sensor=sensor,
                     params=params,
-                    reparam=self.reparam,
-                    wavefront_size=sampler.wavefront_size(),
-                    seed=seed
+                    reparam=self.reparam
                 )
             else:
                 reparam = None
 
             # Generate a set of rays starting at the sensor, keep track of
             # derivatives wrt. sample positions ('pos') if there are any
-            ray, weight, pos, det = self.sample_rays(scene, sensor,
-                                                     sampler, reparam)
+            pos_f, det = self.sample_screen_pos(scene, sensor, sampler, reparam)
+            ray, weight, pos = sample_rays_from_screen_pos(pos_f, sensor)
 
             with dr.resume_grad():
                 L, valid, _ = self.sample(
@@ -207,7 +609,6 @@ class SDFIntegrator(ADIntegrator):
                     scene=scene,
                     sampler=sampler,
                     ray=ray,
-                    reparam=reparam,
                     active=mi.Bool(True)
                 )
 
