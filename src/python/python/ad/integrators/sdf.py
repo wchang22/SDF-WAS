@@ -8,20 +8,65 @@ import gc
 
 from .common import ADIntegrator
 
-def _sample_warp_field(params: mi.SceneParameters,
+def abs_grad(x):
+    return dr.select(x >= 0, 1, -1)
+
+def normalize_grad(v):
+    norm = dr.norm(v)
+    inv_norm = dr.select(dr.neq(norm, 0), 1 / norm, 0)
+    s = v * inv_norm
+    sos = mi.Matrix3f(s * s[0], s * s[1], s * s[2])
+    return inv_norm * (1 - sos)
+
+def _sample_warp_field(sensor: mi.Sensor,
+                       params: mi.SceneParameters,
+                       u: mi.Vector2f,
                        pos: mi.Vector3f,
                        dir: mi.Vector3f,
+                       t: mi.Float,
                        ray_march_eps: mi.Float,
                        𝜆d: mi.Float,
                        exponent: mi.Float,
                        active: mi.Bool):
-    t, _, n, _ = eval_scene(params, pos, ray_march_eps, active)
+    f, hit, dfdx, dfdxx, _ = eval_scene(params, pos, ray_march_eps, active)
 
-    V_direct = t * dr.detach(n)
+    sensor_params = mi.traverse(sensor)
+    camera_to_sample = mi.perspective_projection(
+        sensor.film().size(),
+        sensor.film().crop_size(),
+        sensor.film().crop_offset(),
+        sensor_params['x_fov'],
+        sensor_params['near_clip'],
+        sensor_params['far_clip'])
+    sample_to_camera = camera_to_sample.inverse()
+    camera_to_world = sensor_params['to_world']
 
     with dr.suspend_grad():
-        S = dr.abs(t) + 𝜆d * dr.abs(dr.dot(n, dir))
+        sil_dot = dr.dot(dfdx, dir)
+        S = dr.abs(f) + 𝜆d * dr.abs(sil_dot)
         w = dr.select(S > 1e-4, dr.power(dr.rcp(S), exponent), 0.0)
+
+        near_p = sample_to_camera @ mi.Point3f(u.x, u.y, 0)
+        ddir_du = mi.Matrix3f(camera_to_world.matrix) \
+            @ normalize_grad(near_p) \
+            @ dr.transpose(mi.Matrix3f(sample_to_camera.matrix)) \
+            / sample_to_camera.matrix[3,3]
+        
+        dx_du = t * ddir_du
+        dx_du_t = dr.transpose(dx_du)
+        du_dx = dr.select(dr.neq(t, 0), mi.Matrix3f(dr.inverse(mi.Matrix2f(dx_du_t @ dx_du))) @ dx_du_t, 0)
+
+        da_df = abs_grad(f)
+        da_dsildot = abs_grad(sil_dot)
+
+        ds_du = da_df * dfdx @ dx_du + 𝜆d * da_dsildot * (dfdx @ ddir_du + dir @ dfdxx @ dx_du)
+        ds_du = mi.Vector2f(ds_du.x, ds_du.y)
+        dw_du = -exponent * dr.select(S > 1e-4, dr.power(dr.rcp(S), exponent+1), 0.0) * ds_du
+
+    V_direct = f * dr.detach(dfdx) @ du_dx
+    V_direct = mi.Vector2f(V_direct.x, V_direct.y)
+
+    return w, dw_du, w * V_direct, dr.dot(dw_du, V_direct), dr.detach(f), hit
 
     # # Sample an auxiliary ray from a von Mises Fisher distribution
     # omega_local = mi.warp.square_to_von_mises_fisher(sample, kappa)
@@ -68,7 +113,7 @@ def _sample_warp_field(params: mi.SceneParameters,
     #     tmp2 = ray_frame.to_world(mi.Vector3f(omega_local.x, omega_local.y, 0))
     #     d_w_omega = dr.clamp(tmp1, -1e10, 1e10) * tmp2
 
-    return w, d_w_omega, w * V_direct, dr.dot(d_w_omega, V_direct), dr.detach(t)
+    # return w, d_w_omega, w * V_direct, dr.dot(d_w_omega, V_direct)
 
 
 class _ReparameterizeOp(dr.CustomOp):
@@ -99,17 +144,22 @@ class _ReparameterizeOp(dr.CustomOp):
 
         # Initialize some accumulators
         Z = mi.Float(0.0)
-        dZ = mi.Vector3f(0.0)
-        grad_V = mi.Vector3f(0.0)
+        dZ = mi.Vector2f(0.0)
+        grad_V = mi.Vector2f(0.0)
         grad_div_lhs = mi.Float(0.0)
         it = mi.UInt32(0)
         active = mi.Bool(self.active)
-        t_prev = mi.Float(0.0)
+        
+        ray, _, _ = sample_rays_from_screen_pos(self.pos, self.sensor)
+        f, hit, _, _, _ = eval_scene(self.params, ray.o, self.ray_march_eps, active)
+        t_prev = dr.detach(f)
+        t_delta = dr.detach(f)
+        active &= ~hit
 
         pos_grad = self.grad_in('pos')
 
         loop = mi.Loop(name="reparameterize_screen_pos(): forward propagation",
-                       state=lambda: (it, active, t_prev, Z, dZ, grad_V, grad_div_lhs))
+                       state=lambda: (it, active, t_delta, t_prev, Z, dZ, grad_V, grad_div_lhs))
 
         # Unroll the entire loop in wavefront mode
         # loop.set_uniform(True) # TODO can we turn this back on? (see self.active in loop condition)
@@ -124,22 +174,31 @@ class _ReparameterizeOp(dr.CustomOp):
 
             p = ray.o + t_prev * ray.d
 
-            Z_i, dZ_i, V_i, div_lhs_i, t = _sample_warp_field(self.params, p,
-                                                              self.ray_march_eps,
-                                                              self.𝜆d,
-                                                              self.exponent)
+            Z_i, dZ_i, V_i, div_lhs_i, t, hit = _sample_warp_field(
+                self.sensor,
+                self.params,
+                u,
+                p,
+                ray.d,
+                t_prev,
+                self.ray_march_eps,
+                self.𝜆d,
+                self.exponent,
+                active)
 
             # Do not clear input vertex gradient
             dr.forward_to(V_i, div_lhs_i,
                           flags=dr.ADFlag.ClearEdges | dr.ADFlag.ClearInterior)
 
-            t_prev += t
+            Z += Z_i * t_delta
+            dZ += dZ_i * t_delta
+            grad_V += dr.grad(V_i) * t_delta
+            grad_div_lhs += dr.grad(div_lhs_i) * t_delta
 
-            Z += Z_i * t
-            dZ += dZ_i * t
-            grad_V += dr.grad(V_i) * t
-            grad_div_lhs += dr.grad(div_lhs_i) * t
+            t_delta = t
+            t_prev += t
             it += 1
+            active &= ~hit
 
         inv_Z = dr.rcp(dr.maximum(Z, 1e-8))
         V_theta  = grad_V * inv_Z
@@ -250,10 +309,10 @@ def eval_scene(
         mi.Float(1)
     )
 
-    t, n = sphere.eval(p, active)
+    t, n, dfdxx = sphere.eval(p, active)
     hit = dr.abs(t) < eps
 
-    return t, hit, n, mi.Color3f(dr.select(hit, sphere.color, mi.Color3f(0)))
+    return t, hit, mi.Vector3f(n), dfdxx, mi.Color3f(dr.select(hit, sphere.color, mi.Color3f(0)))
 
 class SphereSDF:
     DRJIT_STRUCT = { 'color' : mi.Color3f, 'transform': mi.Transform4f, 'scale' : mi.Float }
@@ -271,10 +330,14 @@ class SphereSDF:
         p = transformed_p / self.scale
         norm_p = dr.norm(p)
 
-        norm_grad = p / norm_p
+        norm_grad = dr.select(dr.neq(norm_p, 0), p / norm_p, 0)
         normal = dr.transpose(mi.Matrix3f(T_inv.matrix))@norm_grad
 
-        return self.scale * (norm_p - 1.0), normal
+        dfdx = dr.detach(normal)
+        dfdx_outer = mi.Matrix3f(dfdx * dfdx[0], dfdx * dfdx[1], dfdx * dfdx[2])
+        dfdxx = dr.select(dr.neq(norm_p, 0), (1 - dfdx_outer) / (norm_p * self.scale), 0)
+
+        return self.scale * (norm_p - 1.0), normal, dfdxx
 
 class SDFIntegrator(ADIntegrator):
     def __init__(self, props=...):
@@ -319,7 +382,7 @@ class SDFIntegrator(ADIntegrator):
 
         with dr.suspend_grad(when=not primal):
             while loop(active & (it < self.ray_march_max_it)):
-                t, hit, n, c = eval_scene(params, p, self.ray_march_eps, active)
+                t, hit, n, _, c = eval_scene(params, p, self.ray_march_eps, active)
 
                 p[active] = mi.Point3f(p + t * ray.d)
 
@@ -327,7 +390,7 @@ class SDFIntegrator(ADIntegrator):
                 it[active] += 1
 
         if not primal:
-            _, _, n, c = eval_scene(params, p, self.ray_march_eps, True)
+            _, _, n, _, c = eval_scene(params, p, self.ray_march_eps, True)
 
         valid = dr.neq(it, self.ray_march_max_it)
 
