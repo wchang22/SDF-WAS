@@ -63,58 +63,10 @@ def _sample_warp_field(sensor: mi.Sensor,
         ds_du = mi.Vector2f(ds_du.x, ds_du.y)
         dw_du = -exponent * dr.select(S > 1e-4, dr.power(dr.rcp(S), exponent+1), 0.0) * ds_du
 
-    V_direct = f * dr.detach(dfdx) @ du_dx
+    V_direct = -f * dr.detach(dfdx) @ du_dx
     V_direct = mi.Vector2f(V_direct.x, V_direct.y)
 
     return w, dw_du, w * V_direct, dr.dot(dw_du, V_direct), dr.detach(f), hit
-
-    # # Sample an auxiliary ray from a von Mises Fisher distribution
-    # omega_local = mi.warp.square_to_von_mises_fisher(sample, kappa)
-
-    # # Antithetic sampling (optional)
-    # omega_local.x[flip] = -omega_local.x
-    # omega_local.y[flip] = -omega_local.y
-
-    # aux_ray = mi.Ray3f(
-    #     o = ray.o,
-    #     d = ray_frame.to_world(omega_local),
-    #     time = ray.time)
-
-    # # Compute an intersection that follows the intersected shape. For example,
-    # # a perturbation of the translation parameter will propagate to 'si.p'.
-    # # Propagation of such gradients guarantees the correct evaluation of 'V_direct'.
-    # si = scene.ray_intersect(aux_ray,
-    #                          ray_flags=mi.RayFlags.All | mi.RayFlags.FollowShape | mi.RayFlags.BoundaryTest,
-    #                          coherent=False)
-
-    # # Convert into a direction at 'ray.o'. When no surface was intersected,
-    # # copy the original direction
-    # hit = si.is_valid()
-    # V_direct = dr.select(hit, dr.normalize(si.p - ray.o), ray.d)
-
-    # with dr.suspend_grad():
-    #     # Boundary term provided by the underlying shape
-    #     B = dr.select(hit, si.boundary_test, 1.0)
-
-    #     # Inverse of vMF density without normalization constant
-    #     # inv_vmf_density = dr.exp(dr.fma(-omega_local.z, kappa, kappa))
-
-    #     # Better version (here, dr.exp() is constant). However, assumes a
-    #     # specific implementation in mi.warp.square_to_von_mises_fisher() (TODO)
-    #     inv_vmf_density = dr.rcp(dr.fma(sample.y, dr.exp(-2 * kappa), 1 - sample.y))
-
-    #     # Compute harmonic weight, being wary of division by near-zero values
-    #     w_denom = inv_vmf_density - 1 + B
-    #     w_denom_rcp = dr.select(w_denom > 1e-4, dr.rcp(w_denom), 0.0)  # 1 / (D + B)
-    #     w = dr.power(w_denom_rcp, exponent) * inv_vmf_density
-
-    #     # Analytic weight gradient w.r.t. `ray.d` (detaching inv_vmf_density gradient)
-    #     tmp1 = inv_vmf_density * w * w_denom_rcp * kappa * exponent
-    #     tmp2 = ray_frame.to_world(mi.Vector3f(omega_local.x, omega_local.y, 0))
-    #     d_w_omega = dr.clamp(tmp1, -1e10, 1e10) * tmp2
-
-    # return w, d_w_omega, w * V_direct, dr.dot(d_w_omega, V_direct)
-
 
 class _ReparameterizeOp(dr.CustomOp):
     def eval(self, scene, sensor, params, pos, ray_march_max_it, ray_march_eps,
