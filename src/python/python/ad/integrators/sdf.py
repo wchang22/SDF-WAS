@@ -363,7 +363,7 @@ class SDFIntegrator(ADIntegrator):
         normal, color, valid = self.ray_march_scene(primal, scene, ray, active)
 
         light_dir = dr.normalize(mi.Vector3f(0.5, 1, 1))
-        L[valid] += color * dr.maximum(dr.dot(normal, light_dir), 0) + mi.Color3f(0.1, 0.1, 0.1)
+        L[valid] += color * dr.maximum(dr.dot(normal, light_dir), 0) + mi.Color3f(0.01, 0.01, 0.01)
 
         return L, active, None
     
