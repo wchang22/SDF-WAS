@@ -321,6 +321,7 @@ class SDFIntegrator(ADIntegrator):
         active: mi.Bool):
         
         p = mi.Point3f(ray.o)
+        dp = dr.grad(p)
         n = mi.Vector3f(0)
         c = mi.Color3f(0)
 
@@ -328,23 +329,35 @@ class SDFIntegrator(ADIntegrator):
         active = mi.Bool(active)
 
         loop = mi.Loop(name="ray marching",
-                       state=lambda: (it, p, n, c, active))
+                       state=lambda: (it, p, dp, n, c, active))
         
         params = mi.traverse(scene)
 
-        with dr.suspend_grad(when=not primal):
-            while loop(active & (it < self.ray_march_max_it)):
-                t, hit, n, _, c = eval_scene(params, p, self.ray_march_eps, active)
+        while loop(active & (it < self.ray_march_max_it)):
+            tmp_p = mi.Point3f(p)
 
+            if not primal:
+                dr.enable_grad(tmp_p)
+                dr.set_grad(tmp_p, dp)
+
+            t, hit, _, _, _ = eval_scene(params, tmp_p, self.ray_march_eps, active)
+
+            if not primal:
+                dp[active] += dr.forward_to(t * ray.d)
+
+            with dr.suspend_grad(when=not primal):
                 p[active] = mi.Point3f(p + t * ray.d)
 
-                active &= ~hit
-                it[active] += 1
+            active &= ~hit
+            it += 1
 
         if not primal:
-            _, _, n, _, c = eval_scene(params, p, self.ray_march_eps, True)
+            dr.enable_grad(p)
+            dr.set_grad(p, dp)
 
-        valid = dr.neq(it, self.ray_march_max_it)
+        _, _, n, _, c = eval_scene(params, p, self.ray_march_eps, True)
+
+        valid = ~active
 
         return n, c, valid
 
