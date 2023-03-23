@@ -11,13 +11,13 @@ from .common import ADIntegrator
 def abs_grad(x):
     return dr.select(x >= 0, 1, -1)
 
-def _sample_warp_field(params: mi.SceneParameters,
-                       ray: mi.Ray3f,
-                       t: mi.Float,
-                       ray_march_eps: mi.Float,
-                       𝜆d: mi.Float,
-                       exponent: mi.Float,
-                       active: mi.Bool):
+def _evaluate_warp_field(params: mi.SceneParameters,
+                         ray: mi.Ray3f,
+                         t: mi.Float,
+                         ray_march_eps: mi.Float,
+                         𝜆d: mi.Float,
+                         exponent: mi.Float,
+                         active: mi.Bool):
     pos = ray.o + t * ray.d
     f, hit, dfdx, dfdxx, _ = eval_scene(params, pos, ray_march_eps, active)
     dfdx = dr.detach(dfdx)
@@ -69,13 +69,12 @@ class _ReparameterizeOp(dr.CustomOp):
         grad_div_lhs = mi.Float(0.0)
         it = mi.UInt32(0)
         active = mi.Bool(self.active)
-        
-        t_prev = mi.Float(0)
+        t_total = mi.Float(0)
 
         ray_grad_o = self.grad_in('ray').o
 
-        loop = mi.Loop(name="reparameterize_screen_pos(): forward propagation",
-                       state=lambda: (it, active, t_prev, Z, dZ, grad_V, grad_div_lhs))
+        loop = mi.Loop(name="reparameterize_ray(): forward propagation",
+                       state=lambda: (it, active, t_total, Z, dZ, grad_V, grad_div_lhs))
 
         # Unroll the entire loop in wavefront mode
         # loop.set_uniform(True) # TODO can we turn this back on? (see self.active in loop condition)
@@ -87,10 +86,10 @@ class _ReparameterizeOp(dr.CustomOp):
             dr.enable_grad(ray.o)
             dr.set_grad(ray.o, ray_grad_o)
 
-            Z_i, dZ_i, V_i, div_lhs_i, t, hit = _sample_warp_field(
+            Z_i, dZ_i, V_i, div_lhs_i, t, hit = _evaluate_warp_field(
                 self.params,
                 ray,
-                t_prev,
+                t_total,
                 self.ray_march_eps,
                 self.𝜆d,
                 self.exponent,
@@ -105,7 +104,7 @@ class _ReparameterizeOp(dr.CustomOp):
             grad_V += dr.grad(V_i) * t
             grad_div_lhs += dr.grad(div_lhs_i) * t
 
-            t_prev += t
+            t_total += t
             it += 1
             active &= ~hit
 
@@ -120,20 +119,118 @@ class _ReparameterizeOp(dr.CustomOp):
         self.set_grad_out((V_theta, div_V_theta))
 
     def backward(self):
-        pass
+        grad_direction, grad_divergence = self.grad_out()
+
+        # Ignore inactive lanes
+        grad_direction  = dr.select(self.active, grad_direction, 0.0)
+        grad_divergence = dr.select(self.active, grad_divergence, 0.0)
+
+        with dr.suspend_grad():
+            # We need to raymarch a first time to compute the
+            # constants Z and dZ in order to properly weight the incoming gradients
+            Z = mi.Float(0.0)
+            dZ = mi.Vector3f(0.0)
+            it = mi.UInt32(0)
+            active = mi.Bool(self.active)
+            t_total = mi.Float(0)
+
+            loop = mi.Loop(name="reparameterize_ray(): weight normalization",
+                           state=lambda: (it, active, t_total, Z, dZ))
+
+            # Unroll the entire loop in wavefront mode
+            # loop.set_uniform(True) # TODO can we turn this back on? (see self.active in loop condition)
+            loop.set_max_iterations(self.ray_march_max_it)
+            loop.set_eval_stride(self.ray_march_max_it)
+
+            while loop(active & (it < self.ray_march_max_it)):
+                Z_i, dZ_i, _, _, t, hit = _evaluate_warp_field(
+                    self.params,
+                    self.ray,
+                    t_total,
+                    self.ray_march_eps,
+                    self.𝜆d,
+                    self.exponent,
+                    active)
+
+                Z += Z_i * t
+                dZ += dZ_i * t
+
+                t_total += t
+                it += 1
+                active &= ~hit
+
+        # Un-normalized values
+        V = dr.zeros(mi.Vector3f, dr.width(Z))
+        div_V_1 = dr.zeros(mi.Float, dr.width(Z))
+        dr.enable_grad(V, div_V_1)
+
+        # Compute normalized values
+        Z = dr.maximum(Z, 1e-8)
+        V_theta = V / Z
+        divergence = (div_V_1 - dr.dot(V_theta, dZ)) / Z
+        direction = dr.normalize(self.ray.d + V_theta)
+
+        dr.set_grad(direction, grad_direction)
+        dr.set_grad(divergence, grad_divergence)
+        dr.enqueue(dr.ADMode.Backward, direction, divergence)
+        dr.traverse(mi.Float, dr.ADMode.Backward)
+
+        grad_V = dr.grad(V)
+        grad_div_V_1 = dr.grad(div_V_1)
+
+        it = mi.UInt32(0)
+        ray_grad_o = mi.Point3f(0)
+        active = mi.Bool(self.active)
+        t_total = mi.Float(0)
+
+        loop = mi.Loop(name="reparameterize_ray(): backpropagation",
+                       state=lambda: (it, active, t_total))
+
+        # Unroll the entire loop in wavefront mode
+        # loop.set_uniform(True) # TODO can we turn this back on? (see self.active in loop condition)
+        loop.set_max_iterations(self.ray_march_max_it)
+        loop.set_eval_stride(self.ray_march_max_it)
+
+        while loop(active & (it < self.ray_march_max_it)):
+            ray = mi.Ray3f(self.ray)
+            dr.enable_grad(ray.o)
+
+            _, _, V_i, div_V_1_i, t, hit = _evaluate_warp_field(
+                self.params,
+                ray,
+                t_total,
+                self.ray_march_eps,
+                self.𝜆d,
+                self.exponent,
+                active)
+            V_i *= t
+            div_V_1_i *= t
+
+            dr.set_grad(V_i, grad_V)
+            dr.set_grad(div_V_1_i, grad_div_V_1)
+            dr.enqueue(dr.ADMode.Backward, V_i, div_V_1_i)
+            dr.traverse(mi.Float, dr.ADMode.Backward, dr.ADFlag.ClearVertices)
+            ray_grad_o += dr.grad(ray.o)
+            t_total += t
+            it += 1
+            active &= ~hit
+
+        ray_grad = dr.detach(dr.zeros(type(self.ray)))
+        ray_grad.o = ray_grad_o
+        self.set_grad_in('ray', ray_grad)
 
     def name(self):
-        return "reparameterize_screen_pos()"
+        return "reparameterize_ray()"
 
 
-def reparameterize_screen_pos(scene: mi.Scene,
-                              params: mi.SceneParameters,
-                              ray: mi.Ray3f,
-                              ray_march_max_it: int=32,
-                              ray_march_eps=1e-3,
-                              𝜆d: float=1e2,
-                              exponent: float=10.0,
-                              active: mi.Bool = True
+def reparameterize_ray(scene: mi.Scene,
+                        params: mi.SceneParameters,
+                        ray: mi.Ray3f,
+                        ray_march_max_it: int=32,
+                        ray_march_eps=1e-3,
+                        𝜆d: float=1e-1,
+                        exponent: float=4.0,
+                        active: mi.Bool = True
 ) -> Tuple[mi.Vector3f, mi.Float]:
     return dr.custom(_ReparameterizeOp, scene, params, ray,
                      ray_march_max_it, ray_march_eps, 𝜆d, exponent, active)
@@ -226,20 +323,20 @@ class SDFIntegrator(ADIntegrator):
         self.ray_march_max_it =  props.get('ray_march_max_it', 32)
         self.ray_march_eps = props.get('ray_march_eps', 1e-3)
 
-        self.reparam_𝜆d = props.get('reparam_𝜆d', 1e2)
-        self.reparam_exp = props.get('reparam_exp', 10)
+        self.reparam_𝜆d = props.get('reparam_𝜆d', 1e-1)
+        self.reparam_exp = props.get('reparam_exp', 4)
 
     def reparam(self,
             scene: mi.Scene,
             params: mi.SceneParameters,
             ray: mi.Ray3f,
             active: mi.Bool):
-        return reparameterize_screen_pos(scene, params, ray,
-                                         ray_march_max_it=self.ray_march_max_it,
-                                         ray_march_eps=self.ray_march_eps,
-                                         𝜆d=self.reparam_𝜆d,
-                                         exponent=self.reparam_exp,
-                                         active=active)
+        return reparameterize_ray(scene, params, ray,
+                                    ray_march_max_it=self.ray_march_max_it,
+                                    ray_march_eps=self.ray_march_eps,
+                                    𝜆d=self.reparam_𝜆d,
+                                    exponent=self.reparam_exp,
+                                    active=active)
 
     def ray_march_scene(self,
         primal: mi.Bool,
