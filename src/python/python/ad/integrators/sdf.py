@@ -21,7 +21,7 @@ def normalize_grad(v):
 def _sample_warp_field(sensor: mi.Sensor,
                        params: mi.SceneParameters,
                        u: mi.Vector2f,
-                       pos: mi.Vector3f,
+                       pos: mi.Point3f,
                        dir: mi.Vector3f,
                        t: mi.Float,
                        ray_march_eps: mi.Float,
@@ -29,41 +29,42 @@ def _sample_warp_field(sensor: mi.Sensor,
                        exponent: mi.Float,
                        active: mi.Bool):
     f, hit, dfdx, dfdxx, _ = eval_scene(params, pos, ray_march_eps, active)
+    dfdx = dr.detach(dfdx)
 
     sensor_params = mi.traverse(sensor)
-    camera_to_sample = mi.perspective_projection(
-        sensor.film().size(),
-        sensor.film().crop_size(),
-        sensor.film().crop_offset(),
-        sensor_params['x_fov'],
-        sensor_params['near_clip'],
-        sensor_params['far_clip'])
-    sample_to_camera = camera_to_sample.inverse()
+    fov_x = sensor_params['x_fov']
+    film_size = sensor.film().size()
     camera_to_world = sensor_params['to_world']
 
     with dr.suspend_grad():
         sil_dot = dr.dot(dfdx, dir)
         S = dr.abs(f) + 𝜆d * dr.abs(sil_dot)
-        w = dr.select(S > 1e-4, dr.power(dr.rcp(S), exponent), 0.0)
+        w = dr.power(dr.rcp(S) + 1e-6, exponent)
 
-        near_p = sample_to_camera @ mi.Point3f(u.x, u.y, 0)
-        ddir_du = mi.Matrix3f(camera_to_world.matrix) \
-            @ normalize_grad(near_p) \
-            @ dr.transpose(mi.Matrix3f(sample_to_camera.matrix)) \
-            / sample_to_camera.matrix[3,3]
+        width = 2*dr.tan(dr.deg2rad(fov_x)/2)
+        aspect = film_size.x / film_size.y
+        plane_p = mi.Vector3f((1 - u.x - 0.5) * width, (1 - u.y - 0.5) * width / aspect, 1)
+        ddir_du = mi.Matrix3f(camera_to_world.matrix) @ normalize_grad(plane_p) @ mi.Matrix3f(-width, 0, 0, 0, -width/aspect, 0, 0, 0, 0)
         
         dx_du = t * ddir_du
-        dx_du_t = dr.transpose(dx_du)
-        du_dx = dr.select(dr.neq(t, 0), mi.Matrix3f(dr.inverse(mi.Matrix2f(dx_du_t @ dx_du))) @ dx_du_t, 0)
+        ax = 1.0/width
+        ay = ax*aspect
+        x = camera_to_world.inverse() @ pos
+        du_dx = mi.Matrix3f(
+            -ax / x.z, 0, ax * x.x / x.z**2,
+            0, -ay / x.z, ay * x.y / x.z**2,
+            0, 0, 0
+        ) @ mi.Matrix3f(camera_to_world.inverse().matrix)
 
         da_df = abs_grad(f)
         da_dsildot = abs_grad(sil_dot)
 
         ds_du = da_df * dfdx @ dx_du + 𝜆d * da_dsildot * (dfdx @ ddir_du + dir @ dfdxx @ dx_du)
         ds_du = mi.Vector2f(ds_du.x, ds_du.y)
-        dw_du = -exponent * dr.select(S > 1e-4, dr.power(dr.rcp(S), exponent+1), 0.0) * ds_du
+        dw_du = -exponent * dr.power(dr.rcp(S) + 1e-6, exponent+1) * ds_du
 
-    V_direct = -f * dr.detach(dfdx) @ du_dx
+    # V_direct = -(dr.select(w < 1e7, 1, 7.5e2)) * f * du_dx @ dfdx / dr.dot(dfdx, dfdx)
+    V_direct = -f * dr.transpose(du_dx) @ dfdx / dr.dot(dfdx, dfdx)
     V_direct = mi.Vector2f(V_direct.x, V_direct.y)
 
     return w, dw_du, w * V_direct, dr.dot(dw_du, V_direct), dr.detach(f), hit
@@ -298,7 +299,7 @@ class SDFIntegrator(ADIntegrator):
         self.ray_march_max_it =  props.get('ray_march_max_it', 32)
         self.ray_march_eps = props.get('ray_march_eps', 1e-3)
 
-        self.reparam_𝜆d = props.get('reparam_kappa', 1e-1)
+        self.reparam_𝜆d = props.get('reparam_𝜆d', 1e-1)
         self.reparam_exp = props.get('reparam_exp', 4)
 
     def reparam(self,
@@ -359,7 +360,7 @@ class SDFIntegrator(ADIntegrator):
 
         valid = ~active
 
-        return n, c, valid
+        return dr.normalize(n), c, valid
 
     def sample(self,
         mode: dr.ADMode,
