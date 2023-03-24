@@ -1,6 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, Dict # Delayed parsing of type annotations
-import math
+from typing import Tuple # Delayed parsing of type annotations
 
 import drjit as dr
 import mitsuba as mi
@@ -277,19 +276,38 @@ def eval_scene(
     eps: mi.Float,
     active: mi.Bool,
 ) -> Tuple[mi.Float, mi.Bool, mi.Vector3f, mi.Color3f]:
-    color = params.get('sphere.bsdf.reflectance.value')
-    to_world = params.get('sphere.to_world')
+    
+    shape_idx = 0
+    shape_dist = 1e99
+    normal = mi.Vector3f(0)
+    hessian = mi.Matrix3f(0)
+    color = mi.Color3f(0)
 
-    sphere = SphereSDF(
-        color,
-        to_world,
-        mi.Float(1)
-    )
+    while True:
+        reflectance = params.get(f'sphere{shape_idx}.bsdf.reflectance.value')
+        if reflectance is None:
+            break
 
-    t, n, dfdxx = sphere.eval(p, active)
-    hit = dr.abs(t) < eps
+        to_world = params.get(f'sphere{shape_idx}.to_world')
 
-    return t, hit, mi.Vector3f(n), dfdxx, mi.Color3f(dr.select(hit, sphere.color, mi.Color3f(0)))
+        sphere = SphereSDF(
+            reflectance,
+            to_world,
+            mi.Float(1)
+        )
+
+        t, n, dfdxx = sphere.eval(p, active)
+
+        select = t < shape_dist
+        shape_dist = dr.select(select, t, shape_dist)
+        normal = dr.select(select, n, normal)
+        hessian = dr.select(select, dfdxx, hessian)
+        color = dr.select(select, sphere.color, color)
+        hit = dr.abs(shape_dist) < eps
+
+        shape_idx += 1
+
+    return shape_dist, hit, mi.Vector3f(normal), hessian, mi.Color3f(dr.select(hit, color, mi.Color3f(0)))
 
 class SphereSDF:
     DRJIT_STRUCT = { 'color' : mi.Color3f, 'transform': mi.Transform4f, 'scale' : mi.Float }
